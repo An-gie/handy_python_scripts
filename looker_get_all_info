@@ -1,0 +1,231 @@
+# get role, group, and permissions info for all users
+import looker_sdk
+import pandas as pd
+from tqdm import tqdm
+from datetime import date
+
+INCLUDE_PERSONAL = False
+INCLUDE_EMBED_SHARED = False
+
+init_file = "looker.ini"
+
+sdk = looker_sdk.init31()  # Instantiate Looker SDK
+
+#******************************************** User Information
+response_users = sdk.all_users()
+
+data_users = []
+for user in tqdm(response_users, desc='Step 1 of 7: getting user information'):
+    data_users.append({
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "user_id": user.id,
+        "user_email": user.email,
+        "home folder id": user.home_folder_id,
+        "personal folder id": user.personal_folder_id,
+        "disabled user": user.is_disabled,
+        "group_ids": user.group_ids,
+        "role_ids": user.role_ids
+    })
+
+users_df = pd.DataFrame.from_dict(data_users)
+
+#******************************************* Role Information
+response_roles = sdk.all_roles() # get all role information
+
+data_roles = []
+for role in tqdm(response_roles, desc='Step 2 of 7: getting role information'):
+    data_roles.append({
+        "role id": role.id,
+        "role name": role.name,
+        "permission set id": role.permission_set.id,
+        "permission set name": role.permission_set.name,
+        "model set id": role.model_set.id,
+        "model set name": role.model_set.name
+    })
+
+roles_df = pd.DataFrame.from_records(data_roles)
+
+#******************************************* Group Information (this section creates 2 dataframes and then combines them into 1 dataframe called df3)
+response_groups = sdk.all_groups()
+
+data_groups = []
+for group in tqdm(response_groups, desc='Step 3 of 7: getting group information'):
+    data_groups.append({
+        "group id": group.id,
+        "group name": group.name,
+        "user count": group.user_count,
+
+    })
+
+df1 = pd.DataFrame.from_records(data_groups)
+
+#********** All Users in a Group
+# Using the dataframe built above, loop through each id and extract the users that are in each group
+data_groups_users = []
+
+for index, row in df1.iterrows():
+    master_grp = row['group id']
+    response_groups_users = sdk.all_group_users(group_id=master_grp)
+
+# the users within each group, retrieve the users
+    for grp_usr in response_groups_users:
+        data_groups_users.append({
+            "group id": master_grp,
+             "users": grp_usr.id
+             })
+df2 = pd.DataFrame.from_records(data_groups_users)
+
+# Group user IDs by group ID and join them with commas (without this, get a record for each user and group id combo)
+df2 = df2.groupby('group id')['users'].apply(lambda x: ', '.join(map(str, x))).reset_index()
+
+# combine results into one dataframe instead of 2
+df3 = df1.merge(df2[['group id', 'users']], on='group id', how='left')
+
+#******************************************* Permissions Information
+response_permissions = sdk.all_permission_sets()
+
+data_permissions = []
+
+for permission in tqdm(response_permissions, desc='Step 4 of 7: getting permissions information'):
+    data_permissions.append({
+        "permission set id": permission.id,
+        "permission set name": permission.name,
+        "permissions": permission.permissions
+    })
+
+permissions_df = pd.DataFrame.from_records(data_permissions)
+
+# ****************************************** Model Set Information
+response_models = sdk.all_model_sets()
+
+data_models = []
+
+for model in tqdm(response_models, desc='Step 5 of 7: getting model set information'):
+    data_models.append({
+        "model set id": model.id,
+        "model set name": model.name
+    })
+
+model_df = pd.DataFrame.from_records(data_models)
+
+#******************************************* User Attributes Information
+response_ua = sdk.all_user_attributes()
+
+data_ua = []
+
+for ua in tqdm(response_ua, desc='Step 6 of 7: getting user attribute information'):
+    data_ua.append({
+        "user attribute id": ua.id,
+        "user attribute name": ua.name,
+        "user attribute type": ua.type,
+        "user attribute default value": ua.default_value
+    })
+
+ua_df = pd.DataFrame.from_records(data_ua)
+
+#****************************************** Dashboard Information
+response_dashboards = sdk.all_dashboards()
+
+data_dashboard = []
+
+for dashboard in tqdm(response_dashboards, desc='Step 7 of 7: getting dashboard information'):
+    model_id = None
+    model_name = None
+    if dashboard.model:
+        model_id = dashboard.model["id"]
+        model_name = dashboard.model["label"]
+    if dashboard.folder:
+        folder_id = dashboard.folder["id"]
+        folder_name = dashboard.folder["name"]
+        folder_is_personal = dashboard.folder["is_personal"]
+        folder_child_count = dashboard.folder["child_count"]
+    data_dashboard.append({
+        "DashboardMetadataID": dashboard.content_metadata_id,
+        "UniqueID": dashboard.id,
+        "Slug": dashboard.slug,
+        "DashboardTitle": dashboard.title,
+        "Description": dashboard.description,
+        "Model ID": model_id,
+        "Model Name": model_name,
+        "folder_id": folder_id,
+        "Folder Name": folder_name,
+        "Folder- Personal": folder_is_personal,
+        "Folder- Child Count": folder_child_count
+    })
+
+dashboard_df = pd.DataFrame.from_records(data_dashboard)
+#******************************************* Permissions Information
+all_folders = sdk.all_folders()
+folder_access = {}
+
+for f in all_folders:
+    personal = f.is_personal or f.is_personal_descendant
+    if (personal or f.is_users_root or f.is_embed_users_root) and not INCLUDE_PERSONAL:
+        continue
+    if (not personal and f.is_embed) and not INCLUDE_EMBED_SHARED:
+        continue
+    folder_access[f.id] = {"folder_id": f.id,
+                           "name": f.name,
+                           "parent_id": f.parent_id,
+                           "content_metadata_id": f.content_metadata_id,
+                           "personal": personal,
+                           "child_count": f.child_count}
+
+folder_access.pop('lookml')
+
+for f in folder_access:
+    if 'access' not in folder_access[f]:
+        cmgu = sdk.all_content_metadata_accesses(
+            content_metadata_id=folder_access[f]["content_metadata_id"], fields='group_id,user_id,permission_type')
+
+        access = {"groups": [], "users": []}
+        access["groups"] = [{"id": i.group_id, "permission_type": i.permission_type.value}
+                            for i in cmgu if i.group_id is not None]
+        access["users"] = [{"id": i.user_id, "permission_type": i.permission_type.value}
+                           for i in cmgu if i.user_id is not None]
+        folder_access[f]['access'] = access
+
+        cm = sdk.all_content_metadatas(
+            parent_id=folder_access[f]['content_metadata_id'], fields='folder_id,inherits')
+
+        for c in cm:
+            if c.folder_id is not None:
+                try:
+                    if c.inherits:
+                        folder_access[c.folder_id]['access'] = folder_access[f]['access']
+                except:
+                    print('skipping folder {}: no access data'.format(c.folder_id))
+
+folder_permissions = pd.DataFrame(columns=['folder_id', 'folder_name', 'user_id', 'permission_type'])
+
+for folder_id, folder_data in folder_access.items():
+    if 'access' in folder_data:
+        for user_info in folder_data['access']['users']:
+            folder_permissions.loc[len(folder_permissions)] = [folder_id, folder_data['name'], user_info['id'], user_info['permission_type']]
+
+#******************************************* Combine Folder Permission Information into digestible format
+
+
+df_joined = pd.merge(users_df, folder_permissions, on='user_id', how='left')
+df_joined = pd.merge(df_joined, dashboard_df, on='folder_id', how='left')
+
+# Select the desired columns
+dashboard_access = df_joined[['user_id', 'user_email', 'folder_id', 'folder_name', 'permission_type', 'UniqueID', 'DashboardTitle']]
+
+
+
+#******************************************* Put all infor in one Excel file, separ
+today = date.today()
+file_name = f'looker_all_info_{today.strftime("%Y%m%d")}.xlsx'
+
+# write the DataFrame to an Excel file
+with pd.ExcelWriter(file_name) as writer:
+    roles_df.to_excel(writer, sheet_name='role info', index=False)
+    users_df.to_excel(writer, sheet_name='user info', index=False)
+    df3.to_excel(writer, sheet_name='group info', index=False) #this dataframe is the combo of 2 dataframes
+    permissions_df.to_excel(writer, sheet_name='permissions info', index=False)
+    ua_df.to_excel(writer, sheet_name='user attribute info', index=False)
+    model_df.to_excel(writer, sheet_name='model set info', index=False)
+    dashboard_df.to_excel(writer, sheet_name='dashboard info', index=False)
+    dashboard_access.to_excel(writer, sheet_name='dashboard access info', index=False) # this dataframe is the combo of 3 data frames (I had to join info to get this format)
